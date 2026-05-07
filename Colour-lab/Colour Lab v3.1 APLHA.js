@@ -1,8 +1,10 @@
-// Name: Costume Color FX + Color Lab
+// Name: Colour Lab v3.1 ALPHA — Costume Color FX + Color Lab + rAF Animations
 // Description: Runtime costume color effects (hue, saturation, brightness, tint, gradients) with
-//              multi-layer compositing support, plus a full color math and randomization toolkit.
+//              multi-layer compositing, full color math/randomisation toolkit, and a new rAF-driven
+//              animation system that runs at display refresh rate without per-frame block dispatch.
 // By: Claude + GPT (combined)
 // License: MIT
+// Status: ALPHA — animation API may change before v3.1 is final.
 
 (function (Scratch) {
   "use strict";
@@ -553,7 +555,10 @@
   function getRasterCacheEntry(costume) {
     let entry = rasterCache.get(costume);
     if (!entry) {
-      entry = { map: new Map(), version: 0 };
+      // `map` stores in-flight Promises (so concurrent calls coalesce);
+      // `resolved` stores the unwrapped value for synchronous access from the
+      // rAF tick. Promise vs. value are kept in lock-step by rasteriseCostume.
+      entry = { map: new Map(), resolved: new Map(), version: 0 };
       rasterCache.set(costume, entry);
       rasterCacheEntries.add(entry);
     }
@@ -569,6 +574,7 @@
     if (entry) {
       entry.version++;
       entry.map.clear();
+      entry.resolved.clear();
     }
   }
 
@@ -582,6 +588,7 @@
     for (const entry of rasterCacheEntries) {
       entry.version++;
       entry.map.clear();
+      entry.resolved.clear();
     }
   }
 
@@ -632,7 +639,12 @@
 
           const imageData = ctx.getImageData(0, 0, drawW, drawH);
           const result = { canvas, ctx, imageData, img, scale: finalScale };
-          if (cache.version === version) cache.map.set(finalScale, Promise.resolve(result));
+          if (cache.version === version) {
+            cache.map.set(finalScale, Promise.resolve(result));
+            // OPT/v3.1: also publish to the resolved-value map so the rAF tick
+            //           can read the raster synchronously (no Promise unwrap).
+            cache.resolved.set(finalScale, result);
+          }
           resolve(result);
         } catch (e) {
           cache.map.delete(finalScale);
@@ -700,6 +712,89 @@
     }
     renderer.updateDrawableSkinId(target.drawableID, skinId);
     return skinId;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  // SYNCHRONOUS APPLY  (used by the rAF animation tick)
+  // ════════════════════════════════════════════════════════════════════════════
+  //
+  // The rAF tick cannot await — every microtask yield in the loop body costs us
+  // a frame. `applyEffectSync` mirrors `applyToTarget` but reads the raster
+  // straight from the cache's `resolved` map. If the costume hasn't been
+  // rasterised yet for the current scale it kicks off the async load and
+  // returns false; the next tick will find the cache populated.
+  //
+  // ─────────────────────────────────────────────────────────────────────────
+
+  function _resolveScale(costume, scale) {
+    if (typeof scale === "number" && scale > 0) return scale;
+    const dpr = typeof devicePixelRatio !== "undefined" ? devicePixelRatio : 1;
+    const mt = costume.asset && costume.asset.assetType && costume.asset.assetType.contentType;
+    const isSvg = mt === "image/svg+xml";
+    return isSvg ? Math.max(4, dpr * 2) : Math.max(2, dpr);
+  }
+
+  function _getCachedRasterSync(costume, scale) {
+    if (!costume) return null;
+    const entry = rasterCache.get(costume);
+    if (!entry) return null;
+    return entry.resolved.get(_resolveScale(costume, scale)) || null;
+  }
+
+  function applyEffectSync(runtime, target, transformSpec, gradDef) {
+    const renderer = runtime.renderer;
+    if (!renderer) return false;
+
+    // Detect costume switches and clear stale effect state in the same way
+    // applyToTarget would — but synchronously.
+    syncTargetVisualState(runtime, target);
+    const costume = getCurrentCostume(target);
+    if (!costume) return false;
+
+    const cached = _getCachedRasterSync(costume, globalScaleOverride);
+    if (!cached) {
+      // First call against this costume/scale — kick off the async load and
+      // skip this frame. The next tick will hit the populated cache.
+      rasteriseCostume(costume, globalScaleOverride).catch(() => {});
+      return false;
+    }
+
+    const { canvas: srcCanvas, imageData, scale } = cached;
+
+    let workCanvas, workIsPooled = false;
+    if (transformSpec) {
+      const newImageData = processImageData(imageData, transformSpec);
+      workCanvas = _acquireCanvas(newImageData.width, newImageData.height);
+      workIsPooled = true;
+      workCanvas.getContext("2d").putImageData(newImageData, 0, 0);
+    } else {
+      workCanvas = srcCanvas;
+    }
+
+    let outCanvas, outIsPooled;
+    if (gradDef) {
+      outCanvas = applyGradientToCanvas(workCanvas, gradDef);
+      outIsPooled = true;
+    } else {
+      outCanvas = workCanvas;
+      outIsPooled = workIsPooled;
+    }
+
+    const skinResolution = (costume.bitmapResolution || 1) * scale;
+    const newSkinId = renderer.createBitmapSkin(outCanvas, skinResolution);
+
+    if (workIsPooled && workCanvas !== outCanvas) _releaseCanvas(workCanvas);
+    if (outIsPooled) _releaseCanvas(outCanvas);
+
+    renderer.updateDrawableSkinId(target.drawableID, newSkinId);
+
+    // Replace any previous overlay skin (one live skin per target).
+    const existing = overlayState.get(target.id);
+    if (existing && existing.skinId) {
+      try { renderer.destroySkin(existing.skinId); } catch (_) {}
+    }
+    overlayState.set(target.id, { skinId: newSkinId, gradDef: gradDef || null });
+    return true;
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -781,6 +876,10 @@
   const overlayState = new Map();
 
   function storeOverlay(target, newSkinId, gradDef) {
+    // v3.1: a manual one-shot effect cancels any rAF animation on this target.
+    //       The explicit value the user just set should not be immediately
+    //       overwritten by the next animation tick.
+    if (animations.has(target.id)) _stopAnimation(target.id);
     const existing = overlayState.get(target.id);
     if (existing && existing.skinId) {
       const rdr = Scratch.vm.runtime.renderer;
@@ -1023,16 +1122,167 @@
   ];
 
   // ════════════════════════════════════════════════════════════════════════════
+  // ANIMATION SYSTEM (rAF-driven, v3.1)
+  // ════════════════════════════════════════════════════════════════════════════
+  //
+  // Each animation is keyed by targetId → at most one active animation per
+  // sprite. Registering a new animation cancels any previous one (and resolves
+  // its Promise if it was a glide so the awaiting Scratch script unblocks).
+  //
+  // The rAF loop runs only while the registry is non-empty — no idle ticking.
+  // Ticks compute the current spec from elapsed time and call applyEffectSync
+  // (no awaits, no microtask yields). If the costume isn't yet rasterised the
+  // sync path returns false; we just skip that frame.
+  //
+  // Lifecycle:
+  //   - PROJECT_STOP_ALL / PROJECT_START → clear registry, cancel rAF.
+  //   - targetWasRemoved (sprite/clone deleted) → drop that target's animation.
+  //
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const animations = new Map(); // targetId → { kind, params, startTime, resolve? }
+  let rafId = null;
+
+  function _ensureRafLoopRunning() {
+    if (rafId === null && animations.size > 0) {
+      rafId = requestAnimationFrame(_animationTick);
+    }
+  }
+
+  function _cancelRafLoop() {
+    if (rafId !== null) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+  }
+
+  function _replaceAnimation(targetId, anim) {
+    const prev = animations.get(targetId);
+    if (prev && prev.resolve) prev.resolve(); // unblock any awaiting glide
+    animations.set(targetId, anim);
+    _ensureRafLoopRunning();
+  }
+
+  function _stopAnimation(targetId) {
+    const prev = animations.get(targetId);
+    if (!prev) return;
+    animations.delete(targetId);
+    if (prev.resolve) prev.resolve();
+    if (animations.size === 0) _cancelRafLoop();
+  }
+
+  function _stopAllAnimations() {
+    for (const anim of animations.values()) {
+      if (anim.resolve) anim.resolve();
+    }
+    animations.clear();
+    _cancelRafLoop();
+  }
+
+  // Compute the current pixel spec for an animation given elapsed seconds.
+  // Returns { spec, done } where `spec` is fed to applyEffectSync.
+  function _computeAnimSpec(anim, elapsed) {
+    const p = anim.params;
+    switch (anim.kind) {
+      case "hueLoop": {
+        // Continuous rotation; keep modulo small to stay in float-clean range
+        const deg = ((elapsed * p.speed) % 360 + 360) % 360;
+        return { spec: { kind: "hue", deg }, done: false };
+      }
+      case "brightnessPulse": {
+        // Sinusoidal between LO and HI with the given period
+        const phase = (elapsed % p.secs) / p.secs;
+        const t = (Math.sin(phase * Math.PI * 2) + 1) * 0.5; // 0..1
+        const factor = p.lo + (p.hi - p.lo) * t;
+        return { spec: { kind: "brightness", factor }, done: false };
+      }
+      case "saturationPulse": {
+        const phase = (elapsed % p.secs) / p.secs;
+        const t = (Math.sin(phase * Math.PI * 2) + 1) * 0.5;
+        const pct = p.lo + (p.hi - p.lo) * t;
+        return { spec: { kind: "saturation", pct }, done: false };
+      }
+      case "glideHue": {
+        const t = elapsed >= p.secs ? 1 : elapsed / p.secs;
+        const deg = p.start + (p.end - p.start) * t;
+        return { spec: { kind: "hue", deg }, done: t >= 1 };
+      }
+      case "glideSaturation": {
+        const t = elapsed >= p.secs ? 1 : elapsed / p.secs;
+        const pct = p.start + (p.end - p.start) * t;
+        return { spec: { kind: "saturation", pct }, done: t >= 1 };
+      }
+      case "glideBrightness": {
+        const t = elapsed >= p.secs ? 1 : elapsed / p.secs;
+        const factor = p.start + (p.end - p.start) * t;
+        return { spec: { kind: "brightness", factor }, done: t >= 1 };
+      }
+      default:
+        return { spec: null, done: true };
+    }
+  }
+
+  function _animationTick(now) {
+    const runtime = Scratch.vm.runtime;
+    // Snapshot keys — we may delete during iteration when glides finish.
+    const ids = [];
+    for (const id of animations.keys()) ids.push(id);
+
+    for (let i = 0; i < ids.length; i++) {
+      const targetId = ids[i];
+      const anim = animations.get(targetId);
+      if (!anim) continue;
+
+      const target = runtime.getTargetById ? runtime.getTargetById(targetId) : null;
+      if (!target) {
+        // Sprite/clone gone — drop the animation.
+        animations.delete(targetId);
+        if (anim.resolve) anim.resolve();
+        continue;
+      }
+
+      const elapsed = (now - anim.startTime) / 1000;
+      const { spec, done } = _computeAnimSpec(anim, elapsed);
+      if (spec) applyEffectSync(runtime, target, spec, null);
+
+      if (done) {
+        animations.delete(targetId);
+        if (anim.resolve) anim.resolve();
+      }
+    }
+
+    rafId = animations.size > 0 ? requestAnimationFrame(_animationTick) : null;
+  }
+
+  // Lifecycle hooks — installed once per runtime even if the extension is
+  // re-registered (TurboWarp does this when the user adds the extension twice
+  // or reloads the page).
+  function _installRuntimeHooks(runtime) {
+    if (runtime.__colourLabV31AlphaHooksInstalled) return;
+    runtime.__colourLabV31AlphaHooksInstalled = true;
+    const stop = () => _stopAllAnimations();
+    runtime.on && runtime.on("PROJECT_STOP_ALL", stop);
+    runtime.on && runtime.on("PROJECT_START",    stop);
+    runtime.on && runtime.on("targetWasRemoved", (t) => {
+      if (t && t.id) _stopAnimation(t.id);
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // EXTENSION CLASS
   // ════════════════════════════════════════════════════════════════════════════
 
   class CostumeColorFX {
-    constructor(runtime) { this.runtime = runtime; }
+    constructor(runtime) {
+      this.runtime = runtime;
+      // v3.1: install rAF-animation lifecycle hooks (idempotent per runtime).
+      _installRuntimeHooks(runtime);
+    }
 
     getInfo() {
       return {
-        id: "ColourLabV3B",
-        name: "Colour Labv3 BETA",
+        id: "ColourLabV31A",
+        name: "Colour Lab v3.1 ALPHA",
         color1: "#7B4FE0",
         color2: "#5A35BD",
         blocks: [
@@ -1398,6 +1648,92 @@
           },
 
           "---",
+          // ── SECTION 3.5 : Animations (rAF) — v3.1 ALPHA ──────────────────────
+          { blockType: Scratch.BlockType.LABEL, text: "— Animations (rAF) —" },
+          {
+            opcode: "animateHueLoop",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "animate hue rotation on [TARGET] at [SPEED] °/sec",
+            arguments: {
+              TARGET: { type: Scratch.ArgumentType.STRING, defaultValue: "_myself_" },
+              SPEED:  { type: Scratch.ArgumentType.NUMBER, defaultValue: 90 },
+            },
+          },
+          {
+            opcode: "animateBrightnessPulse",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "pulse brightness on [TARGET] from [LO] to [HI] period [SECS] secs",
+            arguments: {
+              TARGET: { type: Scratch.ArgumentType.STRING, defaultValue: "_myself_" },
+              LO:     { type: Scratch.ArgumentType.NUMBER, defaultValue: 0.5 },
+              HI:     { type: Scratch.ArgumentType.NUMBER, defaultValue: 1.5 },
+              SECS:   { type: Scratch.ArgumentType.NUMBER, defaultValue: 1 },
+            },
+          },
+          {
+            opcode: "animateSaturationPulse",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "pulse saturation on [TARGET] from [LO]% to [HI]% period [SECS] secs",
+            arguments: {
+              TARGET: { type: Scratch.ArgumentType.STRING, defaultValue: "_myself_" },
+              LO:     { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+              HI:     { type: Scratch.ArgumentType.NUMBER, defaultValue: 100 },
+              SECS:   { type: Scratch.ArgumentType.NUMBER, defaultValue: 1 },
+            },
+          },
+          {
+            opcode: "glideHue",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "glide hue on [TARGET] from [START]° to [END]° over [SECS] secs",
+            arguments: {
+              TARGET: { type: Scratch.ArgumentType.STRING, defaultValue: "_myself_" },
+              START:  { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+              END:    { type: Scratch.ArgumentType.NUMBER, defaultValue: 360 },
+              SECS:   { type: Scratch.ArgumentType.NUMBER, defaultValue: 1 },
+            },
+          },
+          {
+            opcode: "glideSaturation",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "glide saturation on [TARGET] from [START]% to [END]% over [SECS] secs",
+            arguments: {
+              TARGET: { type: Scratch.ArgumentType.STRING, defaultValue: "_myself_" },
+              START:  { type: Scratch.ArgumentType.NUMBER, defaultValue: 100 },
+              END:    { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+              SECS:   { type: Scratch.ArgumentType.NUMBER, defaultValue: 1 },
+            },
+          },
+          {
+            opcode: "glideBrightness",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "glide brightness on [TARGET] from [START] to [END] over [SECS] secs",
+            arguments: {
+              TARGET: { type: Scratch.ArgumentType.STRING, defaultValue: "_myself_" },
+              START:  { type: Scratch.ArgumentType.NUMBER, defaultValue: 1 },
+              END:    { type: Scratch.ArgumentType.NUMBER, defaultValue: 0 },
+              SECS:   { type: Scratch.ArgumentType.NUMBER, defaultValue: 1 },
+            },
+          },
+          {
+            opcode: "stopAnimation",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "stop animations on [TARGET]",
+            arguments: { TARGET: { type: Scratch.ArgumentType.STRING, defaultValue: "_myself_" } },
+          },
+          {
+            opcode: "stopAllAnimations",
+            blockType: Scratch.BlockType.COMMAND,
+            text: "stop all animations",
+            arguments: {},
+          },
+          {
+            opcode: "isAnimating",
+            blockType: Scratch.BlockType.BOOLEAN,
+            text: "[TARGET] is animating?",
+            arguments: { TARGET: { type: Scratch.ArgumentType.STRING, defaultValue: "_myself_" } },
+          },
+
+          "---",
           // ── SECTION 4 : Utility ───────────────────────────────────────────────
           { blockType: Scratch.BlockType.LABEL, text: "— Costume Utility —" },
           {
@@ -1729,6 +2065,110 @@
     }
 
     // ════════════════════════════════════════════════════════════════════════════
+    // SECTION 3.5 IMPLEMENTATIONS — Animations (rAF, v3.1)
+    // ════════════════════════════════════════════════════════════════════════════
+    //
+    // Fire-and-forget blocks register an animation and return immediately.
+    // Glide blocks return a Promise that the rAF tick resolves at t=1, so
+    // TurboWarp/Scratch awaits them as yielding commands.
+    //
+    // ─────────────────────────────────────────────────────────────────────────
+
+    animateHueLoop(args, util) {
+      const target = this._resolveTarget(args, util);
+      _replaceAnimation(target.id, {
+        kind: "hueLoop",
+        params: { speed: Number(args.SPEED) || 0 },
+        startTime: performance.now(),
+      });
+    }
+
+    animateBrightnessPulse(args, util) {
+      const target = this._resolveTarget(args, util);
+      _replaceAnimation(target.id, {
+        kind: "brightnessPulse",
+        params: {
+          lo:   Number(args.LO),
+          hi:   Number(args.HI),
+          secs: Math.max(0.01, Number(args.SECS)),
+        },
+        startTime: performance.now(),
+      });
+    }
+
+    animateSaturationPulse(args, util) {
+      const target = this._resolveTarget(args, util);
+      _replaceAnimation(target.id, {
+        kind: "saturationPulse",
+        params: {
+          lo:   Math.max(0, Math.min(100, Number(args.LO))),
+          hi:   Math.max(0, Math.min(100, Number(args.HI))),
+          secs: Math.max(0.01, Number(args.SECS)),
+        },
+        startTime: performance.now(),
+      });
+    }
+
+    glideHue(args, util) {
+      const target = this._resolveTarget(args, util);
+      const start = Number(args.START) || 0;
+      const end   = Number(args.END)   || 0;
+      const secs  = Math.max(0.01, Number(args.SECS));
+      return new Promise((resolve) => {
+        _replaceAnimation(target.id, {
+          kind: "glideHue",
+          params: { start, end, secs },
+          startTime: performance.now(),
+          resolve,
+        });
+      });
+    }
+
+    glideSaturation(args, util) {
+      const target = this._resolveTarget(args, util);
+      const start = Math.max(0, Math.min(100, Number(args.START)));
+      const end   = Math.max(0, Math.min(100, Number(args.END)));
+      const secs  = Math.max(0.01, Number(args.SECS));
+      return new Promise((resolve) => {
+        _replaceAnimation(target.id, {
+          kind: "glideSaturation",
+          params: { start, end, secs },
+          startTime: performance.now(),
+          resolve,
+        });
+      });
+    }
+
+    glideBrightness(args, util) {
+      const target = this._resolveTarget(args, util);
+      const start = Number(args.START);
+      const end   = Number(args.END);
+      const secs  = Math.max(0.01, Number(args.SECS));
+      return new Promise((resolve) => {
+        _replaceAnimation(target.id, {
+          kind: "glideBrightness",
+          params: { start, end, secs },
+          startTime: performance.now(),
+          resolve,
+        });
+      });
+    }
+
+    stopAnimation(args, util) {
+      const target = this._resolveTarget(args, util);
+      _stopAnimation(target.id);
+    }
+
+    stopAllAnimations() {
+      _stopAllAnimations();
+    }
+
+    isAnimating(args, util) {
+      const target = this._resolveTarget(args, util);
+      return animations.has(target.id);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════
     // SECTION 2 IMPLEMENTATIONS — Gradients full control
     // ════════════════════════════════════════════════════════════════════════════
 
@@ -1865,6 +2305,7 @@
 
     resetColors(args, util) {
       const target = this._resolveTarget(args, util);
+      _stopAnimation(target.id); // v3.1: full reset also cancels any animation
       clearTargetEffectState(this.runtime, target);
     }
 
@@ -2130,6 +2571,7 @@
 
     layerRemoveAll(args, util) {
       const target = this._resolveTarget(args, util);
+      _stopAnimation(target.id); // v3.1: removing all layers also cancels any animation
       clearTargetEffectState(this.runtime, target);
     }
 
@@ -2159,4 +2601,33 @@
   }
 
   Scratch.extensions.register(new CostumeColorFX(Scratch.vm.runtime));
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // v3.1 ALPHA — rAF Animation System
+  //
+  // Public blocks:
+  //   animate hue rotation on [TARGET] at [SPEED] °/sec
+  //   pulse brightness on [TARGET] from [LO] to [HI] period [SECS] secs
+  //   pulse saturation on [TARGET] from [LO]% to [HI]% period [SECS] secs
+  //   glide hue on [TARGET] from [START]° to [END]° over [SECS] secs        ← yields
+  //   glide saturation on [TARGET] from [START]% to [END]% over [SECS] secs ← yields
+  //   glide brightness on [TARGET] from [START] to [END] over [SECS] secs   ← yields
+  //   stop animations on [TARGET]
+  //   stop all animations
+  //   <[TARGET] is animating?>  (boolean reporter)
+  //
+  // Architecture summary:
+  //   - One rAF loop per page (`rafId`), running only while `animations` Map
+  //     is non-empty.
+  //   - `_replaceAnimation` cancels any prior anim on the same target and
+  //     resolves its Promise (so awaiting glides unblock cleanly).
+  //   - `applyEffectSync` reads from the raster cache's `resolved` map for a
+  //     no-await sync path; falls back to async load on cold cache.
+  //   - One-shot effect blocks (`setHue`, `tintColor`, gradients, etc.) cancel
+  //     any running animation via `storeOverlay`.
+  //   - `resetColors` and `layerRemoveAll` also cancel.
+  //   - Lifecycle hooks (`PROJECT_STOP_ALL`, `PROJECT_START`,
+  //     `targetWasRemoved`) clear the registry so we never animate a deleted
+  //     sprite or stranded after the stop sign.
+  // ─────────────────────────────────────────────────────────────────────────
 })(Scratch);
