@@ -111,6 +111,15 @@
   /** Linear interpolation */
   function lerp(a, b, t) { return a + (b - a) * t; }
 
+  // OPT: one-time endianness check at module load. All current browser platforms
+  //      are little-endian; the BE branch is purely defensive. Used by the 32-bit
+  //      pixel paths that read whole RGBA pixels as a single Uint32.
+  const _isLE = (() => {
+    const buf = new ArrayBuffer(4);
+    new Uint32Array(buf)[0] = 1;
+    return new Uint8Array(buf)[0] === 1;
+  })();
+
   // ════════════════════════════════════════════════════════════════════════════
   // PIXEL-LEVEL TRANSFORM  (used by Costume FX blocks)
   // ════════════════════════════════════════════════════════════════════════════
@@ -251,15 +260,29 @@
         break;
       }
       case "invert": {
-        // OPT: no clamp needed — 255-uint8 is always in-range.
-        // OPT: dst is zero-initialised by ImageData constructor, so transparent pixels
-        //      need no writes at all — skip the entire pixel.
-        for (let i = 0; i < len; i += 4) {
-          if (src[i + 3] === 0) continue;
-          dst[i]   = 255 - src[i];
-          dst[i+1] = 255 - src[i + 1];
-          dst[i+2] = 255 - src[i + 2];
-          dst[i+3] = src[i + 3];
+        // OPT: on little-endian (every browser platform in use today), one Uint32
+        //      read is 4 bytes of an RGBA pixel — `px ^ 0x00FFFFFF` flips R,G,B
+        //      while leaving alpha (high byte on LE) untouched. ~1 load + 1 store
+        //      per pixel vs ~4+4 in the byte loop. Falls back to the byte loop on
+        //      hypothetical big-endian platforms.
+        if (_isLE) {
+          const len32 = len >> 2;
+          const src32 = new Uint32Array(src.buffer, src.byteOffset, len32);
+          const dst32 = new Uint32Array(dst.buffer, dst.byteOffset, len32);
+          for (let i = 0; i < len32; i++) {
+            const px = src32[i];
+            // alpha=0 → leave dst zero-init (matches the byte-loop's transparent skip)
+            if ((px & 0xFF000000) === 0) continue;
+            dst32[i] = px ^ 0x00FFFFFF;
+          }
+        } else {
+          for (let i = 0; i < len; i += 4) {
+            if (src[i + 3] === 0) continue;
+            dst[i]   = 255 - src[i];
+            dst[i+1] = 255 - src[i + 1];
+            dst[i+2] = 255 - src[i + 2];
+            dst[i+3] = src[i + 3];
+          }
         }
         break;
       }
@@ -381,6 +404,59 @@
 
 
   // ════════════════════════════════════════════════════════════════════════════
+  // CANVAS POOL
+  // ════════════════════════════════════════════════════════════════════════════
+  //
+  // Pixel pipelines (compositeAndPush, applyGradientToCanvas, applyToTarget) use
+  // short-lived scratch canvases that are 100% allocated and discarded per-call.
+  // For 60fps animated effects on a 2048×2048 costume, that's ~120–960 canvas
+  // allocations per second — each a multi-MB GPU/CPU bitmap.
+  //
+  // The pool reuses canvases of the same dimensions across calls. Sites that
+  // acquire are responsible for releasing once they're done reading from them.
+  // All callers are synchronous (no await between acquire and release in the same
+  // function), so a shared pool is safe under Scratch's single-threaded model.
+  //
+  // Caps: 6 canvases per dimension, 8 distinct dimensions. Beyond that the
+  // canvas falls through to GC — the pool never grows unbounded.
+  //
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const _canvasPool = new Map();
+  const _CANVAS_POOL_MAX_PER_SIZE = 6;
+  const _CANVAS_POOL_MAX_SIZES = 8;
+
+  function _acquireCanvas(w, h) {
+    const key = w + "x" + h;
+    const free = _canvasPool.get(key);
+    if (free && free.length > 0) {
+      const c = free.pop();
+      const ctx = c.getContext("2d");
+      // Reset state that callers in this file mutate (globalAlpha,
+      // globalCompositeOperation). Other state (transform, fillStyle,
+      // smoothing) isn't touched by our code so we don't pay to reset it.
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = "source-over";
+      ctx.clearRect(0, 0, w, h);
+      return c;
+    }
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    return c;
+  }
+
+  function _releaseCanvas(canvas) {
+    if (!canvas) return;
+    const key = canvas.width + "x" + canvas.height;
+    let free = _canvasPool.get(key);
+    if (!free) {
+      if (_canvasPool.size >= _CANVAS_POOL_MAX_SIZES) return;
+      free = []; _canvasPool.set(key, free);
+    }
+    if (free.length < _CANVAS_POOL_MAX_PER_SIZE) free.push(canvas);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
   // GRADIENT COMPOSITING  (used by Costume FX blocks)
   // ════════════════════════════════════════════════════════════════════════════
 
@@ -408,8 +484,10 @@
   function applyGradientToCanvas(srcCanvas, gradDef) {
     const w = srcCanvas.width, h = srcCanvas.height;
 
-    const gradCanvas = document.createElement("canvas");
-    gradCanvas.width = w; gradCanvas.height = h;
+    // OPT: pull scratch canvases from the pool instead of allocating fresh ones.
+    //      `gradCanvas` is internal scratch (released here); `outCanvas` is
+    //      returned and the caller is responsible for releasing.
+    const gradCanvas = _acquireCanvas(w, h);
     const gCtx = gradCanvas.getContext("2d");
 
     let gradient;
@@ -448,8 +526,7 @@
     gCtx.fillStyle = gradient;
     gCtx.fillRect(0, 0, w, h);
 
-    const outCanvas = document.createElement("canvas");
-    outCanvas.width = w; outCanvas.height = h;
+    const outCanvas = _acquireCanvas(w, h);
     const oCtx = outCanvas.getContext("2d");
 
     oCtx.drawImage(srcCanvas, 0, 0);
@@ -461,7 +538,8 @@
     oCtx.drawImage(srcCanvas, 0, 0);
     // OPT: no source-over reset — canvas is handed to createBitmapSkin and discarded
 
-    return outCanvas;
+    _releaseCanvas(gradCanvas); // gradient scratch is fully consumed
+    return outCanvas;            // caller owns; caller must `_releaseCanvas`
   }
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -589,20 +667,33 @@
     );
     if (!isSnapshotCurrent(snapshot)) return null;
 
-    let workCanvas;
+    let workCanvas, workIsPooled = false;
     if (transformSpec) {
       const newImageData = processImageData(imageData, transformSpec);
-      workCanvas = document.createElement("canvas");
-      workCanvas.width  = newImageData.width;
-      workCanvas.height = newImageData.height;
-      workCanvas.getContext("2d", { willReadFrequently: true }).putImageData(newImageData, 0, 0);
+      workCanvas = _acquireCanvas(newImageData.width, newImageData.height);
+      workIsPooled = true;
+      workCanvas.getContext("2d").putImageData(newImageData, 0, 0);
     } else {
-      workCanvas = srcCanvas;
+      workCanvas = srcCanvas; // cached raster — never pooled
     }
 
-    const outCanvas = gradDef ? applyGradientToCanvas(workCanvas, gradDef) : workCanvas;
+    let outCanvas, outIsPooled;
+    if (gradDef) {
+      outCanvas = applyGradientToCanvas(workCanvas, gradDef);
+      outIsPooled = true;
+    } else {
+      outCanvas = workCanvas;
+      outIsPooled = workIsPooled;
+    }
+
     const skinResolution = (snapshot.costume.bitmapResolution || 1) * scale;
     const skinId = renderer.createBitmapSkin(outCanvas, skinResolution);
+
+    // OPT: createBitmapSkin uploaded the pixels to a GPU texture; the canvases
+    //      are no longer needed. Return any pool-owned ones for the next call.
+    if (workIsPooled && workCanvas !== outCanvas) _releaseCanvas(workCanvas);
+    if (outIsPooled) _releaseCanvas(outCanvas);
+
     if (!isSnapshotCurrent(snapshot)) {
       try { renderer.destroySkin(skinId); } catch (_) {}
       return null;
@@ -823,9 +914,8 @@
 
     const w = baseCanvas.width, h = baseCanvas.height;
 
-    // Output canvas — starts as a copy of the base
-    const out = document.createElement("canvas");
-    out.width = w; out.height = h;
+    // OPT: pool-acquired output canvas — released after createBitmapSkin uploads.
+    const out = _acquireCanvas(w, h);
     const ctx = out.getContext("2d");
     ctx.drawImage(baseCanvas, 0, 0);
 
@@ -833,21 +923,29 @@
       const layer = sorted[li];
       if (!layer.imageData && !layer.gradDef) continue; // empty layer — skip
 
-      // Build layer canvas
-      let layerCanvas;
+      // Build layer canvas. `releaseAfter` is the pool-owned canvas to recycle
+      // once we've drawn it onto `out`.
+      let layerCanvas, releaseAfter = null;
       if (layer.imageData) {
-        layerCanvas = document.createElement("canvas");
-        layerCanvas.width = w; layerCanvas.height = h;
-        layerCanvas.getContext("2d", { willReadFrequently: true }).putImageData(layer.imageData, 0, 0);
-        if (layer.gradDef) layerCanvas = applyGradientToCanvas(layerCanvas, layer.gradDef);
+        layerCanvas = _acquireCanvas(w, h);
+        layerCanvas.getContext("2d").putImageData(layer.imageData, 0, 0);
+        releaseAfter = layerCanvas;
+        if (layer.gradDef) {
+          const grad = applyGradientToCanvas(layerCanvas, layer.gradDef);
+          _releaseCanvas(layerCanvas); // original imageData canvas done
+          layerCanvas = grad;
+          releaseAfter = grad;
+        }
       } else if (layer.gradDef) {
         // Gradient-only layer: draw gradient over the base image
         layerCanvas = applyGradientToCanvas(baseCanvas, layer.gradDef);
+        releaseAfter = layerCanvas;
       }
 
       ctx.globalAlpha = layer.opacity;
       ctx.globalCompositeOperation = layer.blendMode;
       ctx.drawImage(layerCanvas, 0, 0);
+      if (releaseAfter) _releaseCanvas(releaseAfter);
     }
 
     // Clip everything to the original costume's alpha mask
@@ -857,6 +955,8 @@
 
     const skinResolution = (snapshot.costume.bitmapResolution || 1) * scale;
     const newSkinId = renderer.createBitmapSkin(out, skinResolution);
+    _releaseCanvas(out); // pixels are on the GPU now — recycle the canvas
+
     if (!isSnapshotCurrent(snapshot)) {
       try { renderer.destroySkin(newSkinId); } catch (_) {}
       return;
