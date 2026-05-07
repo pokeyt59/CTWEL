@@ -144,6 +144,8 @@
     switch (kind) {
       case "brightness": {
         const factor = spec.factor;
+        // OPT: factor=1 is identity — single memcpy beats 4 stores per pixel
+        if (factor === 1) { dst.set(src); break; }
         // OPT: factor=0 clears all RGB cheaply without entering the per-pixel path
         if (factor <= 0) {
           // dst RGB already zero-initialised; just copy alpha channel
@@ -163,6 +165,17 @@
       }
       case "tint": {
         const { tr, tg, tb, strength: s } = spec;
+        // OPT: strength 0 is identity
+        if (s <= 0) { dst.set(src); break; }
+        // OPT: strength 1 replaces visible pixels with the solid tint colour
+        if (s >= 1) {
+          for (let i = 0; i < len; i += 4) {
+            const a = src[i + 3];
+            if (a === 0) continue; // dst zero-init
+            dst[i] = tr; dst[i+1] = tg; dst[i+2] = tb; dst[i+3] = a;
+          }
+          break;
+        }
         const inv = 1 - s;
         const trs = tr * s, tgs = tg * s, tbs = tb * s;
         for (let i = 0; i < len; i += 4) {
@@ -178,42 +191,43 @@
       case "swap": {
         const { fr, fg, fb, tr, tg, tb, tol, tolSq } = spec;
         const dtr = tr - fr, dtg = tg - fg, dtb = tb - fb;
+        // OPT: pre-copy src into dst so non-matching pixels need zero per-pixel writes.
+        //      TypedArray.set is a memcpy — much cheaper than 4 per-pixel stores.
+        dst.set(src);
         if (tol === 0) {
           // OPT: exact-match fast path — no sqrt, no per-pixel branch on tol
           for (let i = 0; i < len; i += 4) {
-            const a = src[i + 3];
-            if (a === 0) continue; // dst zero-init
+            if (src[i + 3] === 0) continue; // unchanged from memcpy
             if (src[i] === fr && src[i+1] === fg && src[i+2] === fb) {
               dst[i]   = tr; dst[i+1] = tg; dst[i+2] = tb;
-            } else {
-              dst[i]   = src[i]; dst[i+1] = src[i+1]; dst[i+2] = src[i+2];
             }
-            dst[i+3] = a;
           }
         } else {
           const invTol = 1 / tol;
           for (let i = 0; i < len; i += 4) {
-            const a = src[i + 3];
-            if (a === 0) continue; // dst zero-init
+            if (src[i + 3] === 0) continue; // unchanged from memcpy
             const dr = src[i]   - fr;
             const dg = src[i+1] - fg;
             const db = src[i+2] - fb;
             const distSq = dr * dr + dg * dg + db * db;
             if (distSq <= tolSq) {
               const t = 1 - Math.sqrt(distSq) * invTol;
-              dst[i]   = clamp255(src[i]   + dtr * t);
-              dst[i+1] = clamp255(src[i+1] + dtg * t);
-              dst[i+2] = clamp255(src[i+2] + dtb * t);
-            } else {
-              dst[i]   = src[i]; dst[i+1] = src[i+1]; dst[i+2] = src[i+2];
+              // OPT: inline clamp255 to avoid call overhead
+              const nr = src[i]   + dtr * t;
+              const ng = src[i+1] + dtg * t;
+              const nb = src[i+2] + dtb * t;
+              dst[i]   = nr <= 0 ? 0 : nr >= 255 ? 255 : (nr + 0.5) | 0;
+              dst[i+1] = ng <= 0 ? 0 : ng >= 255 ? 255 : (ng + 0.5) | 0;
+              dst[i+2] = nb <= 0 ? 0 : nb >= 255 ? 255 : (nb + 0.5) | 0;
             }
-            dst[i+3] = a;
           }
         }
         break;
       }
       case "channels": {
         const { mr, mg, mb } = spec;
+        // OPT: all-1 multipliers leave src untouched — single memcpy
+        if (mr === 1 && mg === 1 && mb === 1) { dst.set(src); break; }
         for (let i = 0; i < len; i += 4) {
           const a = src[i + 3];
           if (a === 0) continue; // dst zero-init
@@ -251,6 +265,10 @@
       }
       case "alpha": {
         const pct = spec.pct;
+        // OPT: pct=1 is identity — single memcpy
+        if (pct >= 1) { dst.set(src); break; }
+        // OPT: pct=0 leaves dst as zero-init (alpha 0 = fully transparent)
+        if (pct <= 0) break;
         for (let i = 0; i < len; i += 4) {
           const a = src[i + 3];
           // OPT: dst zero-initialised — transparent pixels need no writes at all
@@ -264,7 +282,11 @@
       }
       case "hue": {
         // OPT: work in 0-1 hue space throughout — no *360 then /360 round-trip per pixel
-        const degN = ((spec.deg || 0) % 360 + 360) % 360 / 360;
+        const degMod = ((spec.deg || 0) % 360 + 360) % 360;
+        // OPT: 0° (or any 360° multiple) is identity — skip the entire RGB→HSL→RGB round-trip
+        //      which is both faster and lossless (avoids float-rounding drift on the costume).
+        if (degMod === 0) { dst.set(src); break; }
+        const degN = degMod / 360;
         for (let i = 0; i < len; i += 4) {
           const a = src[i + 3];
           if (a === 0) continue; // dst zero-init
@@ -536,7 +558,9 @@
       img.src = objectUrl;
     });
 
-    cache.set(finalScale, promise);
+    // OPT/FIX: store the in-flight promise so concurrent calls collapse onto one load.
+    // Was `cache.set(...)` which threw — `cache` is `{ map, version }`, not a Map.
+    cache.map.set(finalScale, promise);
     return promise;
   }
 
@@ -1675,8 +1699,11 @@
       const shouldClear = args.CLEAR_CACHE !== false;
       if (next !== globalScaleOverride) {
         globalScaleOverride = next;
-        globalRasterEpoch++;
+        // OPT: clearAllRasterCaches already bumps globalRasterEpoch — only bump it
+        //      ourselves when we're skipping the clear (in-flight snapshots still
+        //      need to be invalidated so they don't push an old-scale skin).
         if (shouldClear) clearAllRasterCaches();
+        else globalRasterEpoch++;
       }
     }
 
