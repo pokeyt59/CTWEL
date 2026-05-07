@@ -290,47 +290,62 @@
         for (let i = 0; i < len; i += 4) {
           const a = src[i + 3];
           if (a === 0) continue; // dst zero-init
+          // OPT: detect gray pixels in raw uint8 — avoids three /255 divides for the
+          //      common "background pixel" case (and hue rotation is a no-op on grey).
+          const sr = src[i], sg = src[i+1], sb = src[i+2];
+          if (sr === sg && sg === sb) {
+            dst[i] = sr; dst[i+1] = sg; dst[i+2] = sb; dst[i+3] = a;
+            continue;
+          }
           // inline rgbToHsl — avoids array allocation
-          let r = src[i] / 255, g = src[i+1] / 255, b = src[i+2] / 255;
+          const r = sr / 255, g = sg / 255, b = sb / 255;
           const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
           const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
           const ll = (mx + mn) * 0.5;
-          let hh, ss;
-          if (mx === mn) {
-            hh = 0; ss = 0;
-          } else {
-            const dd = mx - mn;
-            ss = ll > 0.5 ? dd / (2 - mx - mn) : dd / (mx + mn);
-            if      (mx === r) hh = ((g - b) / dd + (g < b ? 6 : 0)) * 0.16666666666666667;
-            else if (mx === g) hh = ((b - r) / dd + 2)                * 0.16666666666666667;
-            else               hh = ((r - g) / dd + 4)                * 0.16666666666666667;
-          }
+          const dd = mx - mn;
+          const ss = ll > 0.5 ? dd / (2 - mx - mn) : dd / (mx + mn);
+          let hh;
+          if      (mx === r) hh = ((g - b) / dd + (g < b ? 6 : 0)) * 0.16666666666666667;
+          else if (mx === g) hh = ((b - r) / dd + 2)                * 0.16666666666666667;
+          else               hh = ((r - g) / dd + 4)                * 0.16666666666666667;
           hh += degN; if (hh >= 1) hh -= 1;
           // inline hslToRgb — avoids array allocation + 3 call overheads + (q-p) recomputes
-          if (ss === 0) {
-            const v = (ll * 255 + 0.5) | 0;
-            dst[i] = dst[i+1] = dst[i+2] = v;
-          } else {
-            const qq = ll < 0.5 ? ll * (1 + ss) : ll + ss - ll * ss;
-            const pp = 2 * ll - qq;
-            const qp = qq - pp;
-            let tr = hh + 0.3333333333333333; if (tr > 1) tr -= 1;
-            let tb = hh - 0.3333333333333333; if (tb < 0) tb += 1;
-            dst[i]   = ((tr < 0.1666666666666667 ? pp + qp*6*tr : tr < 0.5 ? qq : tr < 0.6666666666666666 ? pp + qp*(0.6666666666666666-tr)*6 : pp) * 255 + 0.5) | 0;
-            dst[i+1] = ((hh < 0.1666666666666667 ? pp + qp*6*hh : hh < 0.5 ? qq : hh < 0.6666666666666666 ? pp + qp*(0.6666666666666666-hh)*6 : pp) * 255 + 0.5) | 0;
-            dst[i+2] = ((tb < 0.1666666666666667 ? pp + qp*6*tb : tb < 0.5 ? qq : tb < 0.6666666666666666 ? pp + qp*(0.6666666666666666-tb)*6 : pp) * 255 + 0.5) | 0;
-          }
+          const qq = ll < 0.5 ? ll * (1 + ss) : ll + ss - ll * ss;
+          const pp = 2 * ll - qq;
+          const qp = qq - pp;
+          let tr = hh + 0.3333333333333333; if (tr > 1) tr -= 1;
+          let tb = hh - 0.3333333333333333; if (tb < 0) tb += 1;
+          dst[i]   = ((tr < 0.1666666666666667 ? pp + qp*6*tr : tr < 0.5 ? qq : tr < 0.6666666666666666 ? pp + qp*(0.6666666666666666-tr)*6 : pp) * 255 + 0.5) | 0;
+          dst[i+1] = ((hh < 0.1666666666666667 ? pp + qp*6*hh : hh < 0.5 ? qq : hh < 0.6666666666666666 ? pp + qp*(0.6666666666666666-hh)*6 : pp) * 255 + 0.5) | 0;
+          dst[i+2] = ((tb < 0.1666666666666667 ? pp + qp*6*tb : tb < 0.5 ? qq : tb < 0.6666666666666666 ? pp + qp*(0.6666666666666666-tb)*6 : pp) * 255 + 0.5) | 0;
           dst[i+3] = a;
         }
         break;
       }
       case "saturation": {
         const pct = spec.pct / 100; // pre-divide once, not per-pixel
+        // OPT: pct=0 is a pure desaturate — hoist out so the per-pixel loop never
+        //      computes hue (unused) or branches on pct each iteration. The result
+        //      is just lightness = (max+min)/2 written to all three channels.
+        if (pct === 0) {
+          for (let i = 0; i < len; i += 4) {
+            const a = src[i + 3];
+            if (a === 0) continue;
+            const sr = src[i], sg = src[i+1], sb = src[i+2];
+            const mx = sr > sg ? (sr > sb ? sr : sb) : (sg > sb ? sg : sb);
+            const mn = sr < sg ? (sr < sb ? sr : sb) : (sg < sb ? sg : sb);
+            // Round-half-up integer mean: (mx+mn+1)>>1 matches the original
+            // `((mx+mn)/2/255 * 255 + 0.5)|0` for all uint8 inputs.
+            const v = (mx + mn + 1) >> 1;
+            dst[i] = dst[i+1] = dst[i+2] = v; dst[i+3] = a;
+          }
+          break;
+        }
         for (let i = 0; i < len; i += 4) {
           const a = src[i + 3];
           if (a === 0) continue; // dst zero-init
           // inline rgbToHsl — avoids array allocation
-          let r = src[i] / 255, g = src[i+1] / 255, b = src[i+2] / 255;
+          const r = src[i] / 255, g = src[i+1] / 255, b = src[i+2] / 255;
           const mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
           const mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
           const ll = (mx + mn) * 0.5;
@@ -343,20 +358,15 @@
             else if (mx === g) hh = ((b - r) / dd + 2)                * 0.16666666666666667;
             else               hh = ((r - g) / dd + 4)                * 0.16666666666666667;
           }
-          // inline hslToRgb with new saturation
-          if (pct === 0) {
-            const v = (ll * 255 + 0.5) | 0;
-            dst[i] = dst[i+1] = dst[i+2] = v;
-          } else {
-            const qq = ll < 0.5 ? ll * (1 + pct) : ll + pct - ll * pct;
-            const pp = 2 * ll - qq;
-            const qp = qq - pp; // OPT: hoist (q-p) — used 6 times in inlined _hue2rgb
-            let tr = hh + 0.3333333333333333; if (tr > 1) tr -= 1;
-            let tb = hh - 0.3333333333333333; if (tb < 0) tb += 1;
-            dst[i]   = ((tr < 0.1666666666666667 ? pp + qp*6*tr : tr < 0.5 ? qq : tr < 0.6666666666666666 ? pp + qp*(0.6666666666666666-tr)*6 : pp) * 255 + 0.5) | 0;
-            dst[i+1] = ((hh < 0.1666666666666667 ? pp + qp*6*hh : hh < 0.5 ? qq : hh < 0.6666666666666666 ? pp + qp*(0.6666666666666666-hh)*6 : pp) * 255 + 0.5) | 0;
-            dst[i+2] = ((tb < 0.1666666666666667 ? pp + qp*6*tb : tb < 0.5 ? qq : tb < 0.6666666666666666 ? pp + qp*(0.6666666666666666-tb)*6 : pp) * 255 + 0.5) | 0;
-          }
+          // inline hslToRgb with the target saturation pct (>0 here)
+          const qq = ll < 0.5 ? ll * (1 + pct) : ll + pct - ll * pct;
+          const pp = 2 * ll - qq;
+          const qp = qq - pp; // OPT: hoist (q-p) — used 6 times in inlined _hue2rgb
+          let tr = hh + 0.3333333333333333; if (tr > 1) tr -= 1;
+          let tb = hh - 0.3333333333333333; if (tb < 0) tb += 1;
+          dst[i]   = ((tr < 0.1666666666666667 ? pp + qp*6*tr : tr < 0.5 ? qq : tr < 0.6666666666666666 ? pp + qp*(0.6666666666666666-tr)*6 : pp) * 255 + 0.5) | 0;
+          dst[i+1] = ((hh < 0.1666666666666667 ? pp + qp*6*hh : hh < 0.5 ? qq : hh < 0.6666666666666666 ? pp + qp*(0.6666666666666666-hh)*6 : pp) * 255 + 0.5) | 0;
+          dst[i+2] = ((tb < 0.1666666666666667 ? pp + qp*6*tb : tb < 0.5 ? qq : tb < 0.6666666666666666 ? pp + qp*(0.6666666666666666-tb)*6 : pp) * 255 + 0.5) | 0;
           dst[i+3] = a;
         }
         break;
@@ -751,8 +761,25 @@
 
   function _getLayerMap(targetId) {
     let m = layerMap.get(targetId);
-    if (!m) { m = new Map(); layerMap.set(targetId, m); }
+    if (!m) {
+      m = new Map();
+      // OPT: attach a sorted-layers cache directly to the map so we don't rebuild
+      //      and re-sort the array on every recomposite. Invalidated only when
+      //      layers are added/removed or `order` changes — blend/opacity/imageData
+      //      mutations don't affect ordering.
+      m._sortedCache = null;
+      layerMap.set(targetId, m);
+    }
     return m;
+  }
+
+  function _getSortedLayers(m) {
+    if (m._sortedCache) return m._sortedCache;
+    const arr = [];
+    for (const v of m.values()) arr.push(v);
+    arr.sort((a, b) => a.order - b.order);
+    m._sortedCache = arr;
+    return arr;
   }
 
   function _getOrCreateLayer(targetId, name) {
@@ -761,6 +788,8 @@
     if (!entry) {
       entry = { imageData: null, gradDef: null, blendMode: "source-over", opacity: 1, order: m.size };
       m.set(name, entry);
+      // New layer — append to cached sorted array if present (its order is highest)
+      if (m._sortedCache) m._sortedCache.push(entry);
     }
     return entry;
   }
@@ -769,6 +798,24 @@
   async function compositeAndPush(runtime, target) {
     const renderer = runtime.renderer;
     if (!renderer) return;
+
+    // OPT: cached sorted-layers array — only rebuilt when layers are added/removed
+    //      or `order` changes; rendered N times in between for free.
+    const layers = _getLayerMap(target.id);
+    const sorted = _getSortedLayers(layers);
+
+    // OPT: if every layer is empty (e.g. after a `layerClear`), the recomposite
+    //      reduces to base+destination-in which is just the original costume.
+    //      Short-circuit to restoreOriginalSkin BEFORE the rasteriseCostume await
+    //      so we don't yield a microtask for nothing.
+    let hasContent = false;
+    for (let li = 0; li < sorted.length; li++) {
+      if (sorted[li].imageData || sorted[li].gradDef) { hasContent = true; break; }
+    }
+    if (!hasContent) {
+      restoreOriginalSkin(runtime, target);
+      return;
+    }
 
     const snapshot = beginTargetMutation(runtime, target);
     const { canvas: baseCanvas, scale } = await rasteriseCostume(snapshot.costume, globalScaleOverride);
@@ -781,10 +828,6 @@
     out.width = w; out.height = h;
     const ctx = out.getContext("2d");
     ctx.drawImage(baseCanvas, 0, 0);
-
-    // Sort layers by insertion order
-    const layers = _getLayerMap(target.id);
-    const sorted = [...layers.values()].sort((a, b) => a.order - b.order);
 
     for (let li = 0; li < sorted.length; li++) {
       const layer = sorted[li];
@@ -851,7 +894,10 @@
     state.visualRevision = (state.visualRevision + 1) | 0;
 
     const m = layerMap.get(target.id);
-    if (m) m.delete(layerName);
+    if (m) {
+      m.delete(layerName);
+      m._sortedCache = null; // invalidate — entry removed
+    }
     if (!m || m.size === 0) {
       layerMap.delete(target.id);
       clearTargetEffectState(runtime, target);
@@ -1992,6 +2038,9 @@
       const name   = String(args.LAYER) || "layer1";
       const entry  = _getOrCreateLayer(target.id, name);
       entry.order  = Number(args.ORDER) || 0;
+      // OPT: order changed — sorted cache is stale; next compositeAndPush rebuilds.
+      const m = layerMap.get(target.id);
+      if (m) m._sortedCache = null;
       const state = syncTargetVisualState(this.runtime, target);
       state.visualRevision = (state.visualRevision + 1) | 0;
       compositeAndPush(this.runtime, target).catch(() => {});
