@@ -22,14 +22,20 @@
   let maxScale = 1000;
 
   // Gesture timing/threshold constants.
-  const TAP_MAX_DURATION = 300;   // ms, max length of a single 2-finger tap
-  const TAP_MAX_MOVEMENT = 20;    // CSS px, max finger drift to still count as a tap
-  const DOUBLE_TAP_GAP = 500;     // ms, max gap between the two 2-finger taps
+  const TAP_MAX_DURATION = 300;     // ms, max length of a single 2-finger tap
+  const TAP_MAX_MOVEMENT = 20;      // CSS px, max finger drift to still count as a tap
+  const DOUBLE_TAP_GAP = 500;       // ms, max gap between the two 2-finger taps
+  const TAP_GROUP_WINDOW = 250;     // ms, both fingers must land within this of each other
+  const MIN_FINGER_SEPARATION = 8;  // CSS px, reject if "two touches" are basically the same point
 
   // Active gesture and last-tap tracking.
   let gesture = null;
   let lastTap = null;
   let canvas = null;
+  // Map of touch identifier -> start timestamp. Lets us reject a "2-finger"
+  // touchstart that's really one finger plus a thumb that's been resting on
+  // the screen.
+  const touchStartTimes = new Map();
 
   function getCanvas() {
     if (canvas && document.contains(canvas)) return canvas;
@@ -104,12 +110,30 @@
   }
 
   function onTouchStart(e) {
-    if (e.touches.length !== 2) return;
-    const t1 = e.touches[0];
-    const t2 = e.touches[1];
+    const now = Date.now();
+    // Record start time for every newly-down finger.
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      touchStartTimes.set(e.changedTouches[i].identifier, now);
+    }
+
+    // Use targetTouches so we only consider touches that started on the canvas
+    // (a thumb resting on the page bezel won't count). Require exactly two.
+    if (e.targetTouches.length !== 2) return;
+
+    const t1 = e.targetTouches[0];
+    const t2 = e.targetTouches[1];
+    const t1Time = touchStartTimes.get(t1.identifier);
+    const t2Time = touchStartTimes.get(t2.identifier);
+    if (t1Time == null || t2Time == null) return;
+    // Both fingers must have landed close in time. Otherwise, this is a
+    // tap with a stationary thumb -- not a real 2-finger gesture.
+    if (Math.abs(t1Time - t2Time) > TAP_GROUP_WINDOW) return;
+
     const p1 = clientToCanvas(t1.clientX, t1.clientY);
     const p2 = clientToCanvas(t2.clientX, t2.clientY);
     if (!p1 || !p2) return;
+    // Reject degenerate "two touches" that are essentially the same point.
+    if (distance(p1, p2) < MIN_FINGER_SEPARATION) return;
 
     const mid = midpoint(p1, p2);
     let target = pickTarget(mid.x, mid.y);
@@ -118,7 +142,7 @@
     if (!isEnabledTarget(target)) return;
 
     gesture = {
-      startTime: Date.now(),
+      startTime: now,
       finger1Id: t1.identifier,
       finger2Id: t2.identifier,
       finger1Start: p1,
@@ -126,7 +150,6 @@
       target,
       initialDistance: distance(p1, p2),
       initialSize: target.size,
-      mode: "pending",
       moved: false
     };
     if (e.cancelable) e.preventDefault();
@@ -141,36 +164,44 @@
     const p2 = clientToCanvas(t2.clientX, t2.clientY);
     if (!p1 || !p2) return;
 
+    // Block native page pinch-zoom on every move; otherwise the browser
+    // steals the gesture and we stop getting touchmove events until the
+    // user lifts.
+    if (e.cancelable) e.preventDefault();
+
     const drift = Math.max(
       distance(p1, gesture.finger1Start),
       distance(p2, gesture.finger2Start)
     );
     if (drift > TAP_MAX_MOVEMENT) gesture.moved = true;
 
-    if (gesture.mode === "pending") {
-      const longEnough = (Date.now() - gesture.startTime) > TAP_MAX_DURATION;
-      if (gesture.moved || longEnough) gesture.mode = "pinch";
-    }
-
-    if (gesture.mode === "pinch") {
-      if (e.cancelable) e.preventDefault();
-      if (gesture.initialDistance > 0 && targetExists(gesture.target)) {
-        const ratio = distance(p1, p2) / gesture.initialDistance;
-        let newSize = gesture.initialSize * ratio;
-        if (Number.isFinite(newSize)) {
-          newSize = Math.max(minScale, Math.min(maxScale, newSize));
-          try { gesture.target.setSize(newSize); } catch (_) {}
-        }
+    // Resize live from the very first move. If this turns out to be a
+    // tap, onTouchEnd will revert to the initial size.
+    if (gesture.initialDistance > 0 && targetExists(gesture.target)) {
+      const ratio = distance(p1, p2) / gesture.initialDistance;
+      let newSize = gesture.initialSize * ratio;
+      if (Number.isFinite(newSize)) {
+        newSize = Math.max(minScale, Math.min(maxScale, newSize));
+        try { gesture.target.setSize(newSize); } catch (_) {}
       }
     }
   }
 
   function onTouchEnd(e) {
+    // Stop tracking start times for fingers that just lifted/cancelled.
+    for (let i = 0; i < e.changedTouches.length; i++) {
+      touchStartTimes.delete(e.changedTouches[i].identifier);
+    }
+
     if (!gesture) return;
 
-    if (gesture.mode === "pending" && !gesture.moved) {
+    if (!gesture.moved) {
       const duration = Date.now() - gesture.startTime;
       if (duration <= TAP_MAX_DURATION) {
+        // It was a tap; undo any micro-resize from finger jitter.
+        if (targetExists(gesture.target)) {
+          try { gesture.target.setSize(gesture.initialSize); } catch (_) {}
+        }
         const now = Date.now();
         if (
           lastTap &&
@@ -196,6 +227,9 @@
     if (!c) return false;
     if (c.__touchSpriteAttached) return true;
     c.__touchSpriteAttached = true;
+    // Tell the browser not to do its own pinch-zoom / pan on the stage,
+    // so our listener actually receives every touchmove.
+    try { c.style.touchAction = "none"; } catch (_) {}
     const opts = { passive: false };
     c.addEventListener("touchstart", onTouchStart, opts);
     c.addEventListener("touchmove", onTouchMove, opts);
@@ -212,6 +246,7 @@
     runtime.on("PROJECT_STOP_ALL", () => {
       gesture = null;
       lastTap = null;
+      touchStartTimes.clear();
     });
   }
 
