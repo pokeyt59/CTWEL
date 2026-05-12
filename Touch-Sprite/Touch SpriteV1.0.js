@@ -28,10 +28,20 @@
   const TAP_GROUP_WINDOW = 250;     // ms, both fingers must land within this of each other
   const MIN_FINGER_SEPARATION = 8;  // CSS px, reject if "two touches" are basically the same point
 
+  // Diagnostic logging. Set DEBUG to false (or call console.log filter) to silence.
+  const DEBUG = true;
+  function log() {
+    if (!DEBUG) return;
+    const a = ["[TouchSprite]"];
+    for (let i = 0; i < arguments.length; i++) a.push(arguments[i]);
+    console.log.apply(console, a);
+  }
+
   // Active gesture and last-tap tracking.
   let gesture = null;
   let lastTap = null;
   let canvas = null;
+  let attached = false;
   // Map of touch identifier -> start timestamp. Lets us reject a "2-finger"
   // touchstart that's really one finger plus a thumb that's been resting on
   // the screen.
@@ -58,6 +68,26 @@
     const rect = c.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return null;
     return { x: clientX - rect.left, y: clientY - rect.top };
+  }
+
+  function touchOnCanvas(touch) {
+    const c = getCanvas();
+    if (!c) return false;
+    const rect = c.getBoundingClientRect();
+    return (
+      touch.clientX >= rect.left &&
+      touch.clientX <= rect.right &&
+      touch.clientY >= rect.top &&
+      touch.clientY <= rect.bottom
+    );
+  }
+
+  function canvasTouches(touchList) {
+    const out = [];
+    for (let i = 0; i < touchList.length; i++) {
+      if (touchOnCanvas(touchList[i])) out.push(touchList[i]);
+    }
+    return out;
   }
 
   function pickTarget(canvasX, canvasY) {
@@ -111,35 +141,41 @@
 
   function onTouchStart(e) {
     const now = Date.now();
-    // Record start time for every newly-down finger.
     for (let i = 0; i < e.changedTouches.length; i++) {
       touchStartTimes.set(e.changedTouches[i].identifier, now);
     }
 
-    // Use targetTouches so we only consider touches that started on the canvas
-    // (a thumb resting on the page bezel won't count). Require exactly two.
-    if (e.targetTouches.length !== 2) return;
+    // Only consider touches that landed inside the canvas's bounding rect.
+    const onCanvas = canvasTouches(e.touches);
+    log("touchstart total=" + e.touches.length, "onCanvas=" + onCanvas.length);
+    if (onCanvas.length !== 2) return;
 
-    const t1 = e.targetTouches[0];
-    const t2 = e.targetTouches[1];
+    const t1 = onCanvas[0];
+    const t2 = onCanvas[1];
     const t1Time = touchStartTimes.get(t1.identifier);
     const t2Time = touchStartTimes.get(t2.identifier);
     if (t1Time == null || t2Time == null) return;
-    // Both fingers must have landed close in time. Otherwise, this is a
-    // tap with a stationary thumb -- not a real 2-finger gesture.
-    if (Math.abs(t1Time - t2Time) > TAP_GROUP_WINDOW) return;
+    if (Math.abs(t1Time - t2Time) > TAP_GROUP_WINDOW) {
+      log("reject: fingers landed too far apart in time", Math.abs(t1Time - t2Time) + "ms");
+      return;
+    }
 
     const p1 = clientToCanvas(t1.clientX, t1.clientY);
     const p2 = clientToCanvas(t2.clientX, t2.clientY);
     if (!p1 || !p2) return;
-    // Reject degenerate "two touches" that are essentially the same point.
-    if (distance(p1, p2) < MIN_FINGER_SEPARATION) return;
+    if (distance(p1, p2) < MIN_FINGER_SEPARATION) {
+      log("reject: fingers too close", distance(p1, p2).toFixed(1) + "px");
+      return;
+    }
 
     const mid = midpoint(p1, p2);
     let target = pickTarget(mid.x, mid.y);
     if (!isEnabledTarget(target)) target = pickTarget(p1.x, p1.y);
     if (!isEnabledTarget(target)) target = pickTarget(p2.x, p2.y);
-    if (!isEnabledTarget(target)) return;
+    if (!isEnabledTarget(target)) {
+      log("reject: no enabled sprite under fingers");
+      return;
+    }
 
     gesture = {
       startTime: now,
@@ -150,8 +186,12 @@
       target,
       initialDistance: distance(p1, p2),
       initialSize: target.size,
-      moved: false
+      moved: false,
+      moveCount: 0
     };
+    log("gesture started on", target.sprite.name,
+        "initialSize=" + target.size.toFixed(1),
+        "initialDist=" + gesture.initialDistance.toFixed(1));
     if (e.cancelable) e.preventDefault();
   }
 
@@ -159,14 +199,14 @@
     if (!gesture) return;
     const t1 = findTouch(e.touches, gesture.finger1Id);
     const t2 = findTouch(e.touches, gesture.finger2Id);
-    if (!t1 || !t2) return;
+    if (!t1 || !t2) {
+      log("touchmove but lost a finger: f1=" + !!t1, "f2=" + !!t2);
+      return;
+    }
     const p1 = clientToCanvas(t1.clientX, t1.clientY);
     const p2 = clientToCanvas(t2.clientX, t2.clientY);
     if (!p1 || !p2) return;
 
-    // Block native page pinch-zoom on every move; otherwise the browser
-    // steals the gesture and we stop getting touchmove events until the
-    // user lifts.
     if (e.cancelable) e.preventDefault();
 
     const drift = Math.max(
@@ -175,30 +215,33 @@
     );
     if (drift > TAP_MAX_MOVEMENT) gesture.moved = true;
 
-    // Resize live from the very first move. If this turns out to be a
-    // tap, onTouchEnd will revert to the initial size.
+    let newSize = gesture.initialSize;
     if (gesture.initialDistance > 0 && targetExists(gesture.target)) {
       const ratio = distance(p1, p2) / gesture.initialDistance;
-      let newSize = gesture.initialSize * ratio;
+      newSize = gesture.initialSize * ratio;
       if (Number.isFinite(newSize)) {
         newSize = Math.max(minScale, Math.min(maxScale, newSize));
         try { gesture.target.setSize(newSize); } catch (_) {}
       }
     }
+    gesture.moveCount++;
+    log("move #" + gesture.moveCount,
+        "dist=" + distance(p1, p2).toFixed(1),
+        "size=" + newSize.toFixed(1));
   }
 
   function onTouchEnd(e) {
-    // Stop tracking start times for fingers that just lifted/cancelled.
     for (let i = 0; i < e.changedTouches.length; i++) {
       touchStartTimes.delete(e.changedTouches[i].identifier);
     }
 
     if (!gesture) return;
 
+    log("touchend after " + gesture.moveCount + " moves, moved=" + gesture.moved);
+
     if (!gesture.moved) {
       const duration = Date.now() - gesture.startTime;
       if (duration <= TAP_MAX_DURATION) {
-        // It was a tap; undo any micro-resize from finger jitter.
         if (targetExists(gesture.target)) {
           try { gesture.target.setSize(gesture.initialSize); } catch (_) {}
         }
@@ -209,9 +252,11 @@
           targetExists(gesture.target) &&
           now - lastTap.time <= DOUBLE_TAP_GAP
         ) {
+          log("double-tap detected -> duplicate");
           duplicateTarget(gesture.target);
           lastTap = null;
         } else {
+          log("first tap recorded");
           lastTap = { time: now, target: gesture.target };
         }
       }
@@ -222,19 +267,39 @@
     if (!f1 || !f2) gesture = null;
   }
 
+  function disableNativeGesturesOn(c) {
+    try {
+      let el = c;
+      let depth = 0;
+      while (
+        el &&
+        el !== document.body &&
+        el !== document.documentElement &&
+        depth < 10
+      ) {
+        el.style.touchAction = "none";
+        el = el.parentElement;
+        depth++;
+      }
+    } catch (_) {}
+  }
+
   function attach() {
     const c = getCanvas();
     if (!c) return false;
-    if (c.__touchSpriteAttached) return true;
-    c.__touchSpriteAttached = true;
-    // Tell the browser not to do its own pinch-zoom / pan on the stage,
-    // so our listener actually receives every touchmove.
-    try { c.style.touchAction = "none"; } catch (_) {}
-    const opts = { passive: false };
-    c.addEventListener("touchstart", onTouchStart, opts);
-    c.addEventListener("touchmove", onTouchMove, opts);
-    c.addEventListener("touchend", onTouchEnd, opts);
-    c.addEventListener("touchcancel", onTouchEnd, opts);
+    // Always (re)apply touch-action in case the canvas's ancestor chain has
+    // changed (e.g. entering/exiting fullscreen).
+    disableNativeGesturesOn(c);
+    if (attached) return true;
+    attached = true;
+    // Capture phase on window so we receive every touch event before any
+    // other handler can swallow it.
+    const opts = { passive: false, capture: true };
+    window.addEventListener("touchstart", onTouchStart, opts);
+    window.addEventListener("touchmove", onTouchMove, opts);
+    window.addEventListener("touchend", onTouchEnd, opts);
+    window.addEventListener("touchcancel", onTouchEnd, opts);
+    log("attached window listeners (capture, non-passive)");
     return true;
   }
 
