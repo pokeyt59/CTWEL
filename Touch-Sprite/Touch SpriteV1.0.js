@@ -150,7 +150,6 @@
       target,
       initialDistance: distance(p1, p2),
       initialSize: target.size,
-      mode: "pending",
       moved: false
     };
     if (e.cancelable) e.preventDefault();
@@ -165,26 +164,25 @@
     const p2 = clientToCanvas(t2.clientX, t2.clientY);
     if (!p1 || !p2) return;
 
+    // Block native page pinch-zoom on every move; otherwise the browser
+    // steals the gesture and we stop getting touchmove events until the
+    // user lifts.
+    if (e.cancelable) e.preventDefault();
+
     const drift = Math.max(
       distance(p1, gesture.finger1Start),
       distance(p2, gesture.finger2Start)
     );
     if (drift > TAP_MAX_MOVEMENT) gesture.moved = true;
 
-    if (gesture.mode === "pending") {
-      const longEnough = (Date.now() - gesture.startTime) > TAP_MAX_DURATION;
-      if (gesture.moved || longEnough) gesture.mode = "pinch";
-    }
-
-    if (gesture.mode === "pinch") {
-      if (e.cancelable) e.preventDefault();
-      if (gesture.initialDistance > 0 && targetExists(gesture.target)) {
-        const ratio = distance(p1, p2) / gesture.initialDistance;
-        let newSize = gesture.initialSize * ratio;
-        if (Number.isFinite(newSize)) {
-          newSize = Math.max(minScale, Math.min(maxScale, newSize));
-          try { gesture.target.setSize(newSize); } catch (_) {}
-        }
+    // Resize live from the very first move. If this turns out to be a
+    // tap, onTouchEnd will revert to the initial size.
+    if (gesture.initialDistance > 0 && targetExists(gesture.target)) {
+      const ratio = distance(p1, p2) / gesture.initialDistance;
+      let newSize = gesture.initialSize * ratio;
+      if (Number.isFinite(newSize)) {
+        newSize = Math.max(minScale, Math.min(maxScale, newSize));
+        try { gesture.target.setSize(newSize); } catch (_) {}
       }
     }
   }
@@ -197,9 +195,13 @@
 
     if (!gesture) return;
 
-    if (gesture.mode === "pending" && !gesture.moved) {
+    if (!gesture.moved) {
       const duration = Date.now() - gesture.startTime;
       if (duration <= TAP_MAX_DURATION) {
+        // It was a tap; undo any micro-resize from finger jitter.
+        if (targetExists(gesture.target)) {
+          try { gesture.target.setSize(gesture.initialSize); } catch (_) {}
+        }
         const now = Date.now();
         if (
           lastTap &&
@@ -225,6 +227,9 @@
     if (!c) return false;
     if (c.__touchSpriteAttached) return true;
     c.__touchSpriteAttached = true;
+    // Tell the browser not to do its own pinch-zoom / pan on the stage,
+    // so our listener actually receives every touchmove.
+    try { c.style.touchAction = "none"; } catch (_) {}
     const opts = { passive: false };
     c.addEventListener("touchstart", onTouchStart, opts);
     c.addEventListener("touchmove", onTouchMove, opts);
